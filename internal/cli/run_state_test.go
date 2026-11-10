@@ -262,6 +262,50 @@ func TestMergeExplicitAgentInstallStatePreservesFreshAssignments(t *testing.T) {
 	}
 }
 
+// TestInstallStampsRunningBinaryVersion closes #6048: `install --agent X`
+// merged into the persisted state through MergeAgents, which preserves the
+// persisted installed_binary_version, and only sync ever stamped AppVersion.
+// A bundled home that only ever installs therefore kept reporting the
+// version it was created with (4.1.1) while the binary provisioning it
+// was 4.4.0.
+func TestInstallStampsRunningBinaryVersion(t *testing.T) {
+	previous := AppVersion
+	AppVersion = "4.4.0"
+	t.Cleanup(func() { AppVersion = previous })
+
+	home := t.TempDir()
+	if err := state.Write(home, state.InstallState{
+		InstalledAgents:        []string{"pi"},
+		InstalledBinaryVersion: "4.1.1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit --agent install: the version must advance to the running binary.
+	merged, err := mergeExplicitAgentInstallState(home, state.InstallState{
+		InstalledAgents:        []string{"pi"},
+		InstalledBinaryVersion: AppVersion,
+	}, []string{"pi"}, InstallFlags{})
+	if err != nil {
+		t.Fatalf("mergeExplicitAgentInstallState() error = %v, want nil", err)
+	}
+	if merged.InstalledBinaryVersion != "4.4.0" {
+		t.Fatalf("InstalledBinaryVersion = %q, want 4.4.0 (seeded 4.1.1)", merged.InstalledBinaryVersion)
+	}
+	if len(merged.InstalledAgents) != 1 || merged.InstalledAgents[0] != "pi" {
+		t.Fatalf("InstalledAgents = %#v, want [pi]", merged.InstalledAgents)
+	}
+
+	// Full install: the fresh state's version must win over the stale one.
+	full := mergeFullInstallState(
+		state.InstallState{InstalledAgents: []string{"pi"}, InstalledBinaryVersion: "4.1.1"},
+		state.InstallState{InstalledAgents: []string{"pi"}, InstalledBinaryVersion: AppVersion},
+	)
+	if full.InstalledBinaryVersion != "4.4.0" {
+		t.Fatalf("full install InstalledBinaryVersion = %q, want 4.4.0 (seeded 4.1.1)", full.InstalledBinaryVersion)
+	}
+}
+
 // TestMergeExplicitAgentInstallStateFailsHonestlyOnCorruptState was renamed
 // from TestMergeExplicitAgentInstallStateSkipsCorruptState (install/sync
 // surface audit finding 2). The old assertion (ok == false, no error) let

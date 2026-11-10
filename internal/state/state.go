@@ -279,6 +279,11 @@ func activeComponents(components []model.ComponentID) []model.ComponentID {
 // caller loads the persisted state, calls MergeAgents, and writes the result
 // back. A full TUI install should use Write directly so that the TUI selection
 // is the source of truth.
+//
+// Note: MergeAgents preserves the persisted InstalledBinaryVersion. A caller
+// performing an install must stamp the running binary's version afterwards
+// (#6048); otherwise a home that only ever installs keeps reporting the
+// version it was created with.
 func MergeAgents(existing InstallState, newAgents []string) InstallState {
 	seen := make(map[string]struct{}, len(existing.InstalledAgents))
 	merged := make([]string, 0, len(existing.InstalledAgents)+len(newAgents))

@@ -435,6 +435,10 @@ func persistInstallState(homeDir string, newState state.InstallState, agentIDs [
 func mergeFullInstallState(existing, fresh state.InstallState) state.InstallState {
 	merged := existing
 	merged.InstalledAgents = fresh.InstalledAgents
+	// #6048: a full install also stamps the running binary's version.
+	// fresh carries AppVersion (set by the install flow), but this merge
+	// previously dropped it and kept the stale persisted value.
+	merged.InstalledBinaryVersion = fresh.InstalledBinaryVersion
 	merged.SelectionConfigured, merged.Components, merged.Skills = fresh.SelectionConfigured, fresh.Components, fresh.Skills
 	merged.Preset, merged.SDDMode, merged.StrictTDD = fresh.Preset, fresh.SDDMode, false
 	merged.CommunityTools, merged.CommunityToolsConfigured = fresh.CommunityTools, fresh.CommunityToolsConfigured
@@ -476,6 +480,11 @@ func mergeExplicitAgentInstallState(homeDir string, newState state.InstallState,
 	}
 
 	merged := state.MergeAgents(existing, agentIDs)
+	// #6048: install records the version of the binary that performed it.
+	// MergeAgents preserves the persisted version, and only sync stamped
+	// AppVersion, so a home that only ever installs kept reporting the
+	// version it was created with. Reuse the same source sync uses.
+	merged.InstalledBinaryVersion = AppVersion
 	if newState.ModelAssignments != nil {
 		merged.ModelAssignments = newState.ModelAssignments
 	}
