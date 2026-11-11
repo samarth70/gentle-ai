@@ -19,6 +19,7 @@ import (
 
 	"github.com/gentleman-programming/gentle-ai/v4/internal/agents"
 	opencodeagent "github.com/gentleman-programming/gentle-ai/v4/internal/agents/opencode"
+	piagent "github.com/gentleman-programming/gentle-ai/v4/internal/agents/pi"
 	"github.com/gentleman-programming/gentle-ai/v4/internal/backup"
 	"github.com/gentleman-programming/gentle-ai/v4/internal/components/agentguidance"
 	"github.com/gentleman-programming/gentle-ai/v4/internal/components/communitytool"
@@ -654,6 +655,22 @@ func (r *syncRuntime) stagePlan() pipeline.StagePlan {
 		}
 	}
 
+	// Pi receives the same assignments in its own routing store
+	// (subagents.json model_profiles), which gentle-pi's profile
+	// application logic reads (#6075). The store lives in the global Pi
+	// agent home, so a workspace sync never runs this step: it must not
+	// mutate the home root.
+	if r.scope == ScopeGlobal && len(r.selection.ModelAssignments) > 0 {
+		for _, adapter := range adapters {
+			if adapter.Agent() == model.AgentPi {
+				apply = append(apply, piModelAssignmentSyncStep{
+					path:        filepath.Join(piagent.AgentConfigPath(r.homeDir), "subagents.json"),
+					assignments: r.selection.ModelAssignments, changedFiles: &r.changedFiles,
+				})
+			}
+		}
+	}
+
 	// Retire remaining markers only after routing has consumed them as ownership
 	// proof to remove retired agents and refresh current roles. Assignments may
 	// also write settings, so cleanup runs after those updates as well.
@@ -783,6 +800,12 @@ func syncBackupTargetsScoped(homeDir, workspaceDir string, scope InstallScope, s
 		for _, adapter := range adapters {
 			if adapter.Agent() == model.AgentOpenCode {
 				paths[syncOpenCodeSettingsPath(homeDir, workspaceDir, scope, adapter)] = struct{}{}
+			}
+			// The Pi routing store carries the same assignments (#6075).
+			// Global scope only, matching the step itself: a workspace sync
+			// never mutates the home root.
+			if !workspace && adapter.Agent() == model.AgentPi {
+				paths[filepath.Join(piagent.AgentConfigPath(homeDir), "subagents.json")] = struct{}{}
 			}
 		}
 	}
@@ -1246,6 +1269,109 @@ func (s openCodeModelAssignmentSyncStep) Run() error {
 	}
 	if err != nil {
 		return fmt.Errorf("write OpenCode model assignments: %w", err)
+	}
+	return nil
+}
+
+// piModelAssignmentSyncStep projects picker model assignments into Pi's
+// routing store (subagents.json model_profiles), the file gentle-pi's
+// /gentle:profiles writes and its profile application logic reads (#6075).
+// It mirrors openCodeModelAssignmentSyncStep: only current picker identities
+// are eligible, legacy saved SDD keys must not be resurrected by an ordinary
+// sync, and entries for agents without an assignment are preserved untouched,
+// as are all other keys in the file (#4946). Agent .md frontmatter is
+// deliberately left alone: those files are Pi/user-owned prompt assets, and
+// the routing store is the owned surface gentle-ai already shares with Pi.
+type piModelAssignmentSyncStep struct {
+	path         string
+	assignments  map[string]model.ModelAssignment
+	changedFiles *[]string
+}
+
+func (s piModelAssignmentSyncStep) ID() string { return "sync:pi:model-assignments" }
+
+func (s piModelAssignmentSyncStep) Run() error {
+	// Refuse leaf links before discovery/read: following one can read and then
+	// overwrite a target not covered by the sync snapshot. The atomic writer
+	// independently refuses leaf links at publication time.
+	info, err := os.Lstat(s.path)
+	if err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("refuse non-regular Pi routing store %q: move the symlink or directory aside, place a regular file at this path, then rerun `gentle-ai sync`", s.path)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat Pi routing store: %w", err)
+	}
+	original, err := os.ReadFile(s.path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read Pi routing store: %w", err)
+	}
+	if len(original) > 0 {
+		if _, err := filemerge.UnmarshalJSONObject(original); err != nil {
+			return fmt.Errorf("refuse to change malformed Pi routing store: %w", err)
+		}
+	}
+	allowed := map[string]bool{"gentle-orchestrator": true, "general": true, "explore": true}
+	for _, name := range opencodeactivation.GentleAIODDPhases() {
+		allowed[name] = true
+	}
+	for _, name := range opencodeactivation.JDPhases() {
+		allowed[name] = true
+	}
+	for _, name := range opencodeactivation.ReviewPhases() {
+		allowed[name] = true
+	}
+	// Profiles already present in the store are eligible too, mirroring how
+	// the OpenCode step admits custom agents discovered from its settings.
+	if len(original) > 0 {
+		existing, err := filemerge.UnmarshalJSONObject(original)
+		if err != nil {
+			return fmt.Errorf("refuse to change malformed Pi routing store: %w", err)
+		}
+		if profiles, ok := existing["model_profiles"].(map[string]any); ok {
+			for name := range profiles {
+				allowed[name] = true
+			}
+		}
+	}
+	profiles := make(map[string]any)
+	for name, assignment := range s.assignments {
+		if !allowed[name] || assignment.ProviderID == "" || assignment.ModelID == "" {
+			continue
+		}
+		entry := map[string]any{"model": assignment.FullID()}
+		// Omitting effort on an effortless assignment preserves the
+		// profile's own value; an explicit picker effort may replace it.
+		if assignment.Effort != "" {
+			entry["effort"] = assignment.Effort
+		}
+		profiles[name] = entry
+	}
+	if len(profiles) == 0 {
+		return nil
+	}
+	overlay, err := json.Marshal(map[string]any{"model_profiles": profiles})
+	if err != nil {
+		return fmt.Errorf("marshal Pi model assignments: %w", err)
+	}
+	updated, err := filemerge.MergeJSONObjectsForPath(s.path, original, overlay)
+	if err != nil {
+		return fmt.Errorf("merge Pi model assignments: %w", err)
+	}
+	if bytes.Equal(original, updated) {
+		return nil
+	}
+	mode := os.FileMode(0644)
+	if info != nil {
+		mode = info.Mode().Perm()
+	}
+	result, err := filemerge.WriteFileAtomic(s.path, updated, mode)
+	// Publication can land before a subsequent durability check fails. Report
+	// the landed path so transaction rollback has the correct evidence.
+	if result.Changed {
+		*s.changedFiles = append(*s.changedFiles, s.path)
+	}
+	if err != nil {
+		return fmt.Errorf("write Pi model assignments: %w", err)
 	}
 	return nil
 }
